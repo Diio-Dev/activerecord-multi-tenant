@@ -63,7 +63,8 @@ describe 'Query Rewriter' do
       @queries.each do |actual_query|
         next unless actual_query.include?('UPDATE "projects" SET "name"')
 
-        expect(format_sql(actual_query)).to eq(format_sql(expected_query.gsub(':account_id', account.id.to_s)))
+        expect(format_sql(actual_query.gsub('$1', "'New Name'")))
+          .to eq(format_sql(expected_query.gsub(':account_id', account.id.to_s)))
       end
     end
 
@@ -99,8 +100,108 @@ describe 'Query Rewriter' do
       @queries.each do |actual_query|
         next unless actual_query.include?('UPDATE "projects" SET "name"')
 
-        expect(format_sql(actual_query.gsub('$1',
-                                            limit.to_s)).strip).to eq(format_sql(expected_query).strip)
+        inlined_query = actual_query.gsub('$1', "'#{new_name}'").gsub('$2', limit.to_s)
+        expect(format_sql(inlined_query).strip).to eq(format_sql(expected_query).strip)
+      end
+    end
+  end
+
+  context 'when bulk updating with a tenant record and Arel or bind values' do
+    let!(:account) { Account.create!(name: 'Test Account') }
+    let!(:other_account) { Account.create!(name: 'Other Account') }
+    let!(:counter) { Counter.create!(account: account, hits: 0) }
+    let!(:other_counter) { Counter.create!(account: other_account, hits: 0) }
+
+    it 'increments the column with increment!' do
+      MultiTenant.with(account) { counter.increment!(:hits) }
+
+      expect(counter.reload.hits).to eq(1)
+    end
+
+    it 'decrements the column with decrement!' do
+      counter.update!(hits: 5)
+
+      MultiTenant.with(account) { counter.decrement!(:hits, 2) }
+
+      expect(counter.reload.hits).to eq(3)
+    end
+
+    it 'increments the column with update_counters' do
+      MultiTenant.with(account) { Counter.update_counters(counter.id, hits: 2) }
+
+      expect(counter.reload.hits).to eq(2)
+    end
+
+    it 'keeps the tenant subquery and only touches the current tenant rows' do
+      MultiTenant.with(account) { Counter.update_all(hits: Counter.arel_table[:hits] + 3) }
+
+      update_query = @queries.find { |query| query.start_with?('UPDATE "counters"') }
+      expect(update_query).to include('"counters"."id" IN (SELECT "counters"."id" FROM "counters"')
+      expect(update_query).to include(%("counters"."account_id" = #{account.id}))
+      expect(counter.reload.hits).to eq(3)
+      expect(other_counter.reload.hits).to eq(0)
+    end
+
+    it 'wraps a SQL literal value like Rails does' do
+      MultiTenant.with(account) { Counter.update_all(hits: Arel.sql('hits + 4')) }
+
+      expect(counter.reload.hits).to eq(4)
+    end
+
+    it 'type casts plain values into bind values' do
+      MultiTenant.with(account) { Counter.update_all(hits: '7') }
+
+      expect(counter.reload.hits).to eq(7)
+      expect(other_counter.reload.hits).to eq(0)
+    end
+
+    it 'still accepts a SQL string' do
+      MultiTenant.with(account) { Counter.update_all('hits = hits + 5') }
+
+      expect(counter.reload.hits).to eq(5)
+    end
+
+    it 'still accepts an array with placeholders' do
+      MultiTenant.with(account) { Counter.update_all(['hits = ?', 6]) }
+
+      expect(counter.reload.hits).to eq(6)
+    end
+
+    context 'with optimistic locking' do
+      let!(:locked_counter) { LockedCounter.create!(account: account, hits: 0) }
+
+      it 'bumps the lock version on a hash update like Rails does' do
+        MultiTenant.with(account) { LockedCounter.update_all(hits: 5) }
+
+        expect(locked_counter.reload).to have_attributes(hits: 5, lock_version: 1)
+      end
+
+      it 'keeps an explicit lock version' do
+        MultiTenant.with(account) { LockedCounter.update_all(hits: 5, lock_version: 9) }
+
+        expect(locked_counter.reload).to have_attributes(hits: 5, lock_version: 9)
+      end
+
+      it 'leaves the lock version alone on a string update' do
+        MultiTenant.with(account) { LockedCounter.update_all('hits = 5') }
+
+        expect(locked_counter.reload).to have_attributes(hits: 5, lock_version: 0)
+      end
+
+      it 'increments the column with increment!' do
+        MultiTenant.with(account) { locked_counter.increment!(:hits) }
+
+        expect(locked_counter.reload.hits).to eq(1)
+      end
+
+      it 'matches the tenantless behavior' do
+        LockedCounter.update_all(hits: 5)
+        tenantless = locked_counter.reload.attributes.slice('hits', 'lock_version')
+        LockedCounter.update_all(hits: 0, lock_version: 0)
+
+        MultiTenant.with(account) { LockedCounter.update_all(hits: 5) }
+
+        expect(locked_counter.reload.attributes.slice('hits', 'lock_version')).to eq(tenantless)
       end
     end
   end
