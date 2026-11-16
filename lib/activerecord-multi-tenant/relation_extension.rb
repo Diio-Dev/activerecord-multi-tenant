@@ -21,13 +21,26 @@ module Arel
 
       stmt = Arel::UpdateManager.new
       stmt.table(table)
-      stmt.set Arel.sql(klass.send(:sanitize_sql_for_assignment, updates))
+      stmt.set update_all_values(updates)
       stmt.wheres = [generate_in_condition_subquery]
 
       klass.connection.update(stmt, "#{klass} Update All").tap { reset }
     end
 
     private
+
+    def update_all_values(updates)
+      return Arel.sql(klass.send(:sanitize_sql_for_assignment, updates)) unless updates.is_a?(Hash)
+
+      if klass.locking_enabled? &&
+         !updates.key?(klass.locking_column) &&
+         !updates.key?(klass.locking_column.to_sym)
+        lock_attribute = table[klass.locking_column]
+        updates = updates.merge(lock_attribute.name => _increment_attribute(lock_attribute))
+      end
+
+      _substitute_values(updates)
+    end
 
     # The generate_in_condition_subquery method generates a subquery that selects
     # records associated with the current tenant.
